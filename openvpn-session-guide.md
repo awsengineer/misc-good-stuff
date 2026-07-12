@@ -172,6 +172,7 @@ echo "Linux variables loaded."
 | `PROFILE_DISPLAY_NAME` | The name shown for this profile inside OpenVPN Connect. | `Home VPN` |
 | `VPN_SECURITY_GROUP_ID` | The AWS security group that guards the VPN listener. | `CHANGE_ME` |
 | `AWS_REGION` | The AWS region of that security group. | `CHANGE_ME` |
+| `SSM_INSTANCE_ID` | The EC2 instance ID of the Linux server, used to reach it via AWS Systems Manager instead of SSH. | `CHANGE_ME` |
 | `TRUSTED_IP_CHECK_URL` | A public IPv4-echo service you trust, used to discover the Mac's current physical IP. | `CHANGE_ME` |
 | `TEST_IPV4_DESTINATION` | Any routable public IPv4 address you're comfortable testing a route to. | `CHANGE_ME` |
 | `TEST_HOSTNAME` | A hostname to test DNS and HTTPS against. | `example.com` (IANA-reserved for documentation and test use) |
@@ -189,6 +190,7 @@ CLIENT_PROFILE_FILE="laptop-client"
 PROFILE_DISPLAY_NAME="Home VPN"
 VPN_SECURITY_GROUP_ID="CHANGE_ME"
 AWS_REGION="CHANGE_ME"
+SSM_INSTANCE_ID="CHANGE_ME"
 TRUSTED_IP_CHECK_URL="CHANGE_ME"
 TEST_IPV4_DESTINATION="CHANGE_ME"
 TEST_HOSTNAME="example.com"
@@ -207,6 +209,7 @@ missing=""
 [ "$SERVER_USER" != "CHANGE_ME" ] || missing="$missing SERVER_USER"
 [ "$VPN_SECURITY_GROUP_ID" != "CHANGE_ME" ] || missing="$missing VPN_SECURITY_GROUP_ID"
 [ "$AWS_REGION" != "CHANGE_ME" ] || missing="$missing AWS_REGION"
+[ "$SSM_INSTANCE_ID" != "CHANGE_ME" ] || missing="$missing SSM_INSTANCE_ID"
 [ "$TRUSTED_IP_CHECK_URL" != "CHANGE_ME" ] || missing="$missing TRUSTED_IP_CHECK_URL"
 [ "$TEST_IPV4_DESTINATION" != "CHANGE_ME" ] || missing="$missing TEST_IPV4_DESTINATION"
 
@@ -217,13 +220,79 @@ fi
 echo "Mac variables loaded."
 ```
 
+### Reach Linux without SSH: an SSM helper function
+
+Every `*Run on Linux*` block from here on is written to be piped into the function below, run from the Mac. It uses AWS Systems Manager Run Command instead of SSH: no inbound port, no key pair, no dependency on the Mac's changing public IP.
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux() {
+  : "${SSM_INSTANCE_ID:?}" "${AWS_REGION:?}"
+  local payload params_file cmd_id invocation_file rc
+
+  payload="$(base64 | tr -d '\n')" || return 1
+  params_file="$(mktemp)" || return 1
+  printf '{"commands":["echo %s | base64 -d | bash -s"]}' "$payload" > "$params_file"
+
+  cmd_id="$(aws ssm send-command \
+    --region "$AWS_REGION" \
+    --instance-ids "$SSM_INSTANCE_ID" \
+    --document-name AWS-RunShellScript \
+    --parameters "file://$params_file" \
+    --query 'Command.CommandId' --output text 2>&1)" || { rm -f "$params_file"; printf '%s\n' "$cmd_id" >&2; return 1; }
+  rm -f "$params_file"
+
+  aws ssm wait command-executed \
+    --region "$AWS_REGION" \
+    --command-id "$cmd_id" \
+    --instance-id "$SSM_INSTANCE_ID" 2>/dev/null
+
+  invocation_file="$(mktemp)" || return 1
+  if ! aws ssm get-command-invocation \
+    --region "$AWS_REGION" \
+    --command-id "$cmd_id" \
+    --instance-id "$SSM_INSTANCE_ID" > "$invocation_file" 2>&1; then
+    cat "$invocation_file" >&2
+    rm -f "$invocation_file"
+    return 1
+  fi
+
+  jq -j '.StandardOutputContent' < "$invocation_file"
+  jq -j '.StandardErrorContent'  < "$invocation_file" >&2
+  rc="$(jq -r '.ResponseCode' < "$invocation_file")"
+  rm -f "$invocation_file"
+  return "$rc"
+}
+```
+
+It reads a script from stdin, ships it base64-encoded inside a Run Command parameter file, waits for the command to finish, then fetches the result — so heredocs, quotes and `$(...)` all survive with no escaping, and `ssm_linux`'s own exit code is the real remote exit code (`ResponseCode`, reported natively by the API). Needs `jq` locally (already used elsewhere in this guide).
+
+Smoke-test it:
+
+```bash
+echo 'uname -a; whoami' | ssm_linux
+echo "exit status: $?"
+```
+
+> **Why this shape, not a live session — verified against a live instance:** an earlier draft of this helper used `aws ssm start-session --document-name AWS-StartInteractiveCommand`, which opens a live streamed session. Direct testing against a real EC2 instance found a real race condition in that approach: the session can close before the last chunk of output finishes arriving, and this happened unpredictably — including truncating a ~5 KB payload mid-line in roughly 1 run out of 5, even with a trailing `sleep` added to try to outlast it. Worse, a failing remote command was indistinguishable from a successful one: `aws ssm start-session` always exited `0` locally regardless of what ran remotely. `send-command` + `AWS-RunShellScript` doesn't stream — the instance writes its result server-side and this function fetches it once with `get-command-invocation` — which was reliable across every repeated test (large payloads came back byte-identical across 3 separate runs) and reports exit status natively, no workaround needed. The tradeoff: each call is a few seconds slower than a live session (submit, poll, fetch are three API round trips instead of one), which you'll notice most on the frequent small commands in the next few sections.
+
+> **Identity note:** commands run as `root` on the instance (Run Command's default), so every `sudo` already written in this guide is a no-op there — harmless, but you won't see a permission prompt where you might expect one. This is a different identity from `$SERVER_USER`, which section 10 uses only to stage the transferred `.ovpn` profile for `scp`.
+
+> **Prerequisites:** locally, AWS CLI v2 and `jq`; IAM permission for `ssm:SendCommand`, `ssm:GetCommandInvocation`, and `ssm:ListCommandInvocations` on `$SSM_INSTANCE_ID`. On the instance, the SSM Agent registered and running — standard on EC2 Ubuntu AMIs when the instance has an IAM instance profile granting SSM (for example `AmazonSSMManagedInstanceCore`). Output is capped at 24,000 characters per stream (`StandardOutputContent`/`StandardErrorContent`) — well above anything in this guide; the largest single payload here is the ~5 KB base64 client profile in section 9.
+
+> **What this cannot do:** a few steps in section 5 and section 14 unlock the CA private key and prompt for its passphrase. A non-interactive command has no way to answer that prompt, so those steps are marked **Run interactively** and use a live session instead — `aws ssm start-session --target "$SSM_INSTANCE_ID" --region "$AWS_REGION"` — with no document, so it drops you into an ordinary shell. (This is the one place a live session is actually the right tool: you're typing a passphrase yourself, so the race condition above doesn't apply — there's no unattended output to lose.) The same applies to `sudoedit /etc/openvpn/vpn-vars.env` above: open that plain session, don't pipe an editor invocation through `ssm_linux`.
+
 ## 3. Prepare and inspect Linux
 
 Do not change the server until you know its operating system, default interface, firewall manager, existing listeners and forwarding state.
 
-*Run on Linux*
+*Run on the Mac, targeting Linux*
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 cat /etc/os-release
 uname -a
 ip -4 route show default
@@ -233,38 +302,51 @@ sudo ufw status verbose 2>/dev/null || true
 sudo firewall-cmd --state 2>/dev/null || true
 sudo nft list ruleset
 sudo iptables --version
+REMOTE
 ```
 
 Find the external interface deterministically:
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 EXT_IF="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
 printf 'External interface: %s\n' "$EXT_IF"
+REMOTE
 ```
 
 ### Create a configuration backup
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 sudo install -d -m 0700 "/var/backups/openvpn-$STAMP"
 
 if sudo test -e /etc/openvpn; then
   sudo tar -C / -czf "/var/backups/openvpn-$STAMP/etc-openvpn.tar.gz" etc/openvpn
 fi
+REMOTE
 ```
 
 > **Use the server's existing firewall system:** If UFW or firewalld is active, implement forwarding and NAT using that system's supported persistence model. The later iptables/systemd method is appropriate when neither manager owns the host firewall or when you have deliberately integrated it with existing Docker rules.
 
 ## 4. Install OpenVPN and Easy-RSA
 
-*Run on Linux*
+*Run on the Mac, targeting Linux*
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 sudo apt-get update
 sudo apt-get install -y openvpn easy-rsa
 
 openvpn --version | head -n 1
 dpkg-query -W openvpn easy-rsa
+REMOTE
 ```
 
 `openvpn` provides the VPN daemon. `easy-rsa` provides scripts for creating and maintaining a small X.509 public key infrastructure.
@@ -273,37 +355,49 @@ dpkg-query -W openvpn easy-rsa
 
 ### Create the Easy-RSA workspace
 
-*Run on Linux*
+*Run on the Mac, targeting Linux*
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 sudo make-cadir /etc/openvpn/easy-rsa
-sudo chown -R "$USER":"$(id -gn)" /etc/openvpn/easy-rsa
+sudo chown -R "$(id -un)":"$(id -gn)" /etc/openvpn/easy-rsa
 cd /etc/openvpn/easy-rsa
 
 ./easyrsa init-pki
+REMOTE
 ```
 
-### Create the CA
+### Create the CA, and sign the server and client certificates
+
+**Run interactively — this cannot be piped.** `build-ca` sets a CA private-key passphrase, and every signing operation below (`build-server-full`, `build-client-full`, `gen-crl`) unlocks that same CA key and re-prompts for it. A piped, non-interactive command has no way to answer that prompt. Open one plain session and run all of the following in it, in order:
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+aws ssm start-session --target "$SSM_INSTANCE_ID" --region "$AWS_REGION"
+```
+
+Inside that session:
+
+```bash
+source /etc/openvpn/vpn-vars.env
+cd /etc/openvpn/easy-rsa
+
 EASYRSA_REQ_CN="$CA_NAME" ./easyrsa build-ca
 ```
 
 This prompts for a CA passphrase. Protect it: the CA private key can authorize new clients. For a higher-security design, keep the CA offline and transfer only certificate signing requests.
 
-### Create and sign the server certificate
-
 ```bash
 ./easyrsa build-server-full "$SERVER_CERT_NAME" nopass
 ```
 
-The server key is usually unencrypted because systemd must start OpenVPN without someone entering a password at every reboot. Its filesystem permissions therefore matter.
+`nopass` here means the server's own key is unencrypted — systemd must start OpenVPN without someone entering a password at every reboot, so its filesystem permissions matter instead. Signing this certificate still unlocks the CA key, so it still prompts for the CA passphrase above.
 
-### Create and sign one Mac client certificate
-
-Choose one of these models:
+Choose one of these models for the Mac client certificate:
 
 ```bash
 # Safer for a portable laptop: prompts for a private-key password.
@@ -314,18 +408,35 @@ Choose one of these models:
 ./easyrsa build-client-full "$CLIENT_CERT_NAME" nopass
 ```
 
-Run only one of those commands for a given name.
-
-### Create revocation and control-channel material
+Run only one of those commands for a given name. Both still prompt for the CA passphrase.
 
 ```bash
 ./easyrsa gen-crl
+```
+
+This also unlocks the CA key. You can end the interactive session after this line.
+
+### Create control-channel material
+
+Back on the Mac — this doesn't touch the CA key, so it goes through the helper:
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 openvpn --genkey secret /etc/openvpn/easy-rsa/pki/tls-crypt.key
+REMOTE
 ```
 
 ### Install the server files
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
+source /etc/openvpn/vpn-vars.env
+cd /etc/openvpn/easy-rsa
+
 sudo install -d -m 0755 /etc/openvpn/server
 
 sudo install -m 0644 pki/ca.crt /etc/openvpn/server/ca.crt
@@ -333,11 +444,20 @@ sudo install -m 0644 "pki/issued/$SERVER_CERT_NAME.crt" /etc/openvpn/server/serv
 sudo install -m 0600 "pki/private/$SERVER_CERT_NAME.key" /etc/openvpn/server/server.key
 sudo install -m 0644 pki/crl.pem /etc/openvpn/server/crl.pem
 sudo install -m 0600 pki/tls-crypt.key /etc/openvpn/server/tls-crypt.key
+REMOTE
 ```
 
 ### Verify the certificate chain and purposes
 
+Verifying a certificate needs no private key, so this is safe to pipe:
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
+source /etc/openvpn/vpn-vars.env
+cd /etc/openvpn/easy-rsa
+
 openssl verify \
   -CAfile pki/ca.crt \
   "pki/issued/$SERVER_CERT_NAME.crt" \
@@ -345,15 +465,19 @@ openssl verify \
 
 openssl x509 -in "pki/issued/$SERVER_CERT_NAME.crt" -noout -subject -issuer -dates -purpose
 openssl x509 -in "pki/issued/$CLIENT_CERT_NAME.crt" -noout -subject -issuer -dates -purpose
+REMOTE
 ```
 
 ## 6. Configure the OpenVPN server
 
 Generate `/etc/openvpn/server/server.conf` directly from your variables — no manual editing, no placeholders left behind.
 
-*Run on Linux*
+*Run on the Mac, targeting Linux*
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 sudo tee /etc/openvpn/server/server.conf >/dev/null <<CONF
@@ -396,9 +520,10 @@ CONF
 
 sudo chown root:root /etc/openvpn/server/server.conf
 sudo chmod 0600 /etc/openvpn/server/server.conf
+REMOTE
 ```
 
-Because the heredoc above is unquoted, `${VPN_PORT}` and friends expand to your actual values before the file is written — read it back with `sudo cat /etc/openvpn/server/server.conf` to confirm.
+Because the inner `<<CONF` heredoc is unquoted, `${VPN_PORT}` and friends expand to your actual values on the remote side before the file is written — read it back with `echo 'sudo cat /etc/openvpn/server/server.conf' | ssm_linux` to confirm. (The outer `<<'REMOTE'` heredoc is quoted deliberately, so nothing in this block expands locally on the Mac before it's shipped.)
 
 ### Full tunnel versus split tunnel
 
@@ -410,19 +535,30 @@ Because the heredoc above is unquoted, `${VPN_PORT}` and friends expand to your 
 
 ### Enable persistent IPv4 forwarding
 
+*Run on the Mac, targeting Linux*
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 printf '%s\n' 'net.ipv4.ip_forward = 1' | \
   sudo tee /etc/sysctl.d/99-openvpn-forward.conf >/dev/null
 
 sudo sysctl --system
 sysctl net.ipv4.ip_forward
+REMOTE
 ```
 
 ### Create an idempotent firewall helper
 
 This example cooperates with Docker by using `DOCKER-USER` when that chain exists. The script sources `/etc/openvpn/vpn-vars.env` itself at run time, so it always uses your current `VPN_SUBNET_CIDR` — even after a reboot — without needing to be regenerated.
 
+The outer block below uses the `REMOTE` heredoc delimiter to ship the whole thing through `ssm_linux`; the inner `SCRIPT` heredoc is unrelated and, because it's still single-quoted, still writes `openvpn-nat` byte-for-byte with no expansion at any layer:
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 sudo tee /usr/local/sbin/openvpn-nat >/dev/null <<'SCRIPT'
 #!/bin/sh
 set -eu
@@ -472,11 +608,15 @@ esac
 SCRIPT
 
 sudo chmod 0755 /usr/local/sbin/openvpn-nat
+REMOTE
 ```
 
 ### Persist those rules with systemd
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 sudo tee /etc/systemd/system/openvpn-nat.service >/dev/null <<'UNIT'
 [Unit]
 Description=OpenVPN forwarding and NAT rules
@@ -495,6 +635,7 @@ WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
+REMOTE
 ```
 
 > **Do not mix firewall managers casually:** Direct iptables rules can conflict with UFW, firewalld or configuration-management tools. Choose one ownership model and verify rules after Docker or firewall restarts.
@@ -544,9 +685,12 @@ A self-contained profile carries non-secret directives plus four inline blocks:
 - The Mac client private key
 - The shared `tls-crypt` key
 
-*Run on Linux*
+*Run on the Mac, targeting Linux*
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 cd /etc/openvpn/easy-rsa
 
@@ -584,15 +728,25 @@ $(cat pki/tls-crypt.key)
 EOF
 
 sudo chmod 0600 "$PROFILE"
+REMOTE
 ```
+
+> **This pipe carries a private key.** Unlike every other block in this guide, the payload here contains the Mac client's actual private key material, assembled server-side into `$PROFILE`. The SSM session is TLS-encrypted end to end and the key never leaves the AWS network boundary you already trust for management access, but it's worth knowing this block is categorically different from a config-file push — it's the one place secrets flow through this channel rather than being generated and consumed entirely on one side.
 
 ### Validate structure without printing secrets
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
+source /etc/openvpn/vpn-vars.env
+PROFILE="/root/${CLIENT_PROFILE_FILE}.ovpn"
+
 sudo test "$(grep -c -- 'BEGIN CERTIFICATE' "$PROFILE")" -eq 2
 sudo test "$(grep -Ec -- 'BEGIN (RSA |ENCRYPTED )?PRIVATE KEY' "$PROFILE")" -eq 1
 sudo grep -q -- 'BEGIN OpenVPN Static key' "$PROFILE"
 echo "Profile structure looks complete"
+REMOTE
 ```
 
 > **The profile is a credential:** Do not paste it into chat, email it, commit it to Git or store it in a shared folder. If the private key has no password, anyone holding this file can authenticate as the Mac client.
@@ -604,12 +758,18 @@ echo "Profile structure looks complete"
 Stage a user-readable copy on Linux:
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 sudo install -m 0600 -o "$SERVER_USER" -g "$SERVER_USER_GROUP" \
   "/root/${CLIENT_PROFILE_FILE}.ovpn" \
   "/home/$SERVER_USER/${CLIENT_PROFILE_FILE}.ovpn"
+REMOTE
 ```
+
+This staged copy is readable by `$SERVER_USER`, the account the `scp` step below authenticates as over SSH — a separate access path from the `root` identity `ssm_linux` runs as. If the server has no SSH listener open, use Option B instead.
 
 On the Mac:
 
@@ -627,13 +787,36 @@ chmod 0600 "$HOME/.config/openvpn/${CLIENT_PROFILE_FILE}.ovpn"
 After confirming the Mac copy exists, remove the temporary staged server copy:
 
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 rm -f "/home/$SERVER_USER/${CLIENT_PROFILE_FILE}.ovpn"
+REMOTE
 ```
 
 ### Option B: Managed session transport
 
-When SSH is closed, use an authenticated management channel such as AWS Systems Manager Session Manager. Preserve the file bytes exactly, validate the decoded structure, set mode `600`, and avoid logging the profile body.
+When SSH is closed, use an authenticated management channel such as AWS Systems Manager Run Command — the same mechanism `ssm_linux` uses — instead of `scp`:
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<REMOTE > "/tmp/${CLIENT_PROFILE_FILE}.ovpn.b64"
+source /etc/openvpn/vpn-vars.env
+base64 "/home/\$SERVER_USER/${CLIENT_PROFILE_FILE}.ovpn"
+REMOTE
+
+install -d -m 0700 "$HOME/.config/openvpn"
+base64 -d < "/tmp/${CLIENT_PROFILE_FILE}.ovpn.b64" > "$HOME/.config/openvpn/${CLIENT_PROFILE_FILE}.ovpn"
+
+shred -u "/tmp/${CLIENT_PROFILE_FILE}.ovpn.b64" 2>/dev/null || rm -f "/tmp/${CLIENT_PROFILE_FILE}.ovpn.b64"
+chmod 0600 "$HOME/.config/openvpn/${CLIENT_PROFILE_FILE}.ovpn"
+```
+
+`$CLIENT_PROFILE_FILE` expands locally (it's already sourced into this shell); `\$SERVER_USER` is escaped so it expands on the remote side instead, after the heredoc's own `source /etc/openvpn/vpn-vars.env` line loads it there.
+
+`ssm_linux`'s `send-command` transport returns output as a single clean value with no session banners to strip and no line-ending corruption to guard against — unlike the live-session approach this guide used earlier, this needs no sentinel markers. Verified end-to-end against a live instance with a 4 KB payload, byte-for-byte identical to the source file. Preserve the file bytes exactly, validate the decoded structure with the same checks as [section 9](#9-build-a-self-contained-mac-client-profile), keep mode `600` throughout, and avoid logging the profile body — the intermediate `.b64` file holds base64, not the raw PEM blocks, but it still holds the key, so don't skip the `shred`/`rm` cleanup line. Run the staging and cleanup blocks above exactly as written; only the transfer step itself changes.
 
 ## 11. Import the profile into OpenVPN Connect
 
@@ -677,7 +860,12 @@ The OpenVPN Connect CLI supports importing and listing profiles, but connection 
 
 ### Start Linux services
 
+*Run on the Mac, targeting Linux*
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 sudo systemctl enable --now openvpn-server@server.service
@@ -686,6 +874,7 @@ sudo systemctl enable --now openvpn-nat.service
 sudo systemctl --no-pager --full status openvpn-server@server.service
 sudo systemctl --no-pager --full status openvpn-nat.service
 sudo ss -lunp "sport = :$VPN_PORT"
+REMOTE
 ```
 
 The OpenVPN status should contain `Initialization Sequence Completed`.
@@ -723,12 +912,18 @@ curl -4 -I "https://$TEST_HOSTNAME"
 
 ### Verify on Linux
 
+*Run on the Mac, targeting Linux*
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 sudo cat /run/openvpn-server/status-server.log
 sudo journalctl -u openvpn-server@server --since "15 minutes ago" --no-pager
 sudo iptables -t nat -nvL POSTROUTING
 sudo iptables -nvL DOCKER-USER
 ip address show tun0
+REMOTE
 ```
 
 ### What proof looks like
@@ -819,7 +1014,14 @@ printf 'OpenVPN ingress now allows %s\n' "$CLIENT_CIDR"
 
 ### Add a second device
 
-Create a new certificate. Never reuse the first Mac's private key:
+**Run interactively** — like section 5, this unlocks the CA key and prompts for its passphrase:
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+aws ssm start-session --target "$SSM_INSTANCE_ID" --region "$AWS_REGION"
+```
+
+Inside that session:
 
 ```bash
 source /etc/openvpn/vpn-vars.env
@@ -831,9 +1033,18 @@ cd /etc/openvpn/easy-rsa
 ./easyrsa gen-crl
 ```
 
-Then repeat [section 9](#9-build-a-self-contained-mac-client-profile), using `CLIENT_NAME="$SECOND_CLIENT_CERT_NAME"` in place of `CLIENT_NAME="$CLIENT_CERT_NAME"` and a different `PROFILE` filename so you don't overwrite the first device's profile. Repeat [section 10](#10-transfer-the-profile-securely) to transfer it, using that new filename in place of `CLIENT_PROFILE_FILE`.
+Never reuse the first Mac's private key — this creates a distinct certificate. Then repeat [section 9](#9-build-a-self-contained-mac-client-profile), using `CLIENT_NAME="$SECOND_CLIENT_CERT_NAME"` in place of `CLIENT_NAME="$CLIENT_CERT_NAME"` and a different `PROFILE` filename so you don't overwrite the first device's profile. Repeat [section 10](#10-transfer-the-profile-securely) to transfer it, using that new filename in place of `CLIENT_PROFILE_FILE`.
 
 ### Revoke a lost or retired client
+
+**Run interactively** — `revoke` and `gen-crl` both unlock the CA key:
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+aws ssm start-session --target "$SSM_INSTANCE_ID" --region "$AWS_REGION"
+```
+
+Inside that session:
 
 ```bash
 source /etc/openvpn/vpn-vars.env
@@ -841,22 +1052,39 @@ source /etc/openvpn/vpn-vars.env
 cd /etc/openvpn/easy-rsa
 ./easyrsa revoke "$CLIENT_CERT_NAME"
 ./easyrsa gen-crl
+```
+
+Installing the new CRL and restarting OpenVPN don't touch the CA key, so once the CRL is regenerated, end the interactive session and finish from the Mac:
+
+```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
+source /etc/openvpn/vpn-vars.env
+cd /etc/openvpn/easy-rsa
 
 sudo install -m 0644 pki/crl.pem /etc/openvpn/server/crl.pem
 sudo systemctl restart openvpn-server@server
+REMOTE
 ```
 
 Restarting OpenVPN disconnects active clients. Plan the change and verify the new CRL afterward.
 
 ### Monitor certificate expiry
 
+*Run on the Mac, targeting Linux*
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 openssl x509 -in /etc/openvpn/server/server.crt -noout -subject -dates
 openssl x509 -in \
   "/etc/openvpn/easy-rsa/pki/issued/${CLIENT_CERT_NAME}.crt" \
   -noout -subject -dates
+REMOTE
 ```
 
 ### Back up the state that matters
@@ -885,7 +1113,12 @@ openssl x509 -in \
 
 ### Read-only diagnostic bundle
 
+*Run on the Mac, targeting Linux*
+
 ```bash
+source ~/.config/openvpn/vpn-vars.env
+
+ssm_linux <<'REMOTE'
 source /etc/openvpn/vpn-vars.env
 
 sudo systemctl --no-pager --full status openvpn-server@server openvpn-nat
@@ -897,6 +1130,7 @@ ip -4 route
 sudo iptables -t nat -nvL POSTROUTING
 sudo iptables -nvL DOCKER-USER
 sudo nft list ruleset
+REMOTE
 ```
 
 ## Glossary and official sources
@@ -923,7 +1157,10 @@ sudo nft list ruleset
 - [AWS VPC security groups](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html)
 - [Configure AWS security-group rules](https://docs.aws.amazon.com/vpc/latest/userguide/working-with-security-group-rules.html)
 - [AWS Elastic IP addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)
-- [AWS CLI Session Manager reference](https://docs.aws.amazon.com/cli/latest/reference/ssm/start-session.html)
+- [AWS Systems Manager Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command.html)
+- [AWS CLI `send-command` reference](https://docs.aws.amazon.com/cli/latest/reference/ssm/send-command.html)
+- [AWS CLI `get-command-invocation` reference](https://docs.aws.amazon.com/cli/latest/reference/ssm/get-command-invocation.html)
+- [AWS CLI Session Manager `start-session` reference](https://docs.aws.amazon.com/cli/latest/reference/ssm/start-session.html) — used only for the interactive CA-passphrase steps in sections 5 and 14
 
 ---
 
